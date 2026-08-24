@@ -1934,7 +1934,11 @@ print("🚀 NEXA Chat v3")
 print("🌐 http://127.0.0.1:8080")
 print("")
 
+import os
+
+PORT=int(os.environ.get("PORT","8080"))
+
 ThreadingHTTPServer(
-    ("0.0.0.0",8080),
+    ("0.0.0.0",PORT),
     Server
 ).serve_forever()
