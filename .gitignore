@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 .env
 nexa-error.log
+nexa.db
+nexa-error.log
+nexa.log
+__pycache__/
+*.pyc
