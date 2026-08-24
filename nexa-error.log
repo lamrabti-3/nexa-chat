@@ -33,3 +33,4 @@ sqlite3.OperationalError: table users has no column named online
 127.0.0.1 - - [24/Aug/2026 17:41:22] "POST /api/login HTTP/1.1" 200 -
 127.0.0.1 - - [24/Aug/2026 17:41:22] "GET /api/contacts?user=8 HTTP/1.1" 200 -
 127.0.0.1 - - [24/Aug/2026 17:44:28] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [24/Aug/2026 17:57:16] "GET /favicon.ico HTTP/1.1" 404 -

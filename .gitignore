@@ -3,3 +3,4 @@ nexa.db
 __pycache__/
 *.pyc
 .env
+nexa-error.log
