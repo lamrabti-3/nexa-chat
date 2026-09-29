@@ -1,1944 +1,325 @@
-import sqlite3, json, re, html
+import os
+import json
+import html
+import sqlite3
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-DB = "nexa.db"
+APP_NAME = "NEXA | مساعدي الشخصي"
+DB_PATH = os.environ.get("NEXA_DB", "nexa.db")
+AI_KEY = os.environ.get("AI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+AI_URL = os.environ.get("AI_API_URL") or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
+MEMORY_LIMIT = 40
 
-def conn():
-    c = sqlite3.connect(DB, timeout=10)
+RESEARCH = [
+    {
+        "title": "NIST AI Risk Management Framework",
+        "url": "https://www.nist.gov/itl/ai-risk-management-framework",
+        "summary": "الشفافية، تقليل البيانات، الخصوصية، وتحديد مسؤولية الإنسان عناصر أساسية عند تصميم نظام ذكاء اصطناعي موثوق.",
+        "category": "سلامة وخصوصية"
+    },
+    {
+        "title": "APA: Self-Determination Theory",
+        "url": "https://www.apa.org/research-practice/conduct-research/self-determination-theory.html",
+        "summary": "تدعم الدافعية ثلاثة احتياجات: الاستقلالية، الإحساس بالكفاءة، والعلاقة بالآخرين. لذلك يقترح المساعد خيارات بدل فرض قرار.",
+        "category": "الدافعية"
+    },
+    {
+        "title": "APA Dictionary: Big Five Personality Model",
+        "url": "https://dictionary.apa.org/big-five-personality-model",
+        "summary": "نموذج وصفي للفروق الفردية، وليس تشخيصًا طبيًا أو حكمًا نهائيًا على شخصية الإنسان.",
+        "category": "فهم الشخصية"
+    },
+    {
+        "title": "APA Guidelines for Psychological Assessment",
+        "url": "https://www.apa.org/about/policy/guidelines-psychological-assessment-evaluation.pdf",
+        "summary": "تؤكد إرشادات التقييم النفسي أهمية الغرض من التقييم، والانتباه للخطأ والتحيز، وعدم استعمال النتائج بلا سياق.",
+        "category": "حدود التحليل"
+    }
+]
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def db():
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
-
-    c.execute("""CREATE TABLE IF NOT EXISTS users(
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        phone TEXT UNIQUE NOT NULL,
-        name TEXT NOT NULL,
-        avatar TEXT DEFAULT '👤',
-        bio TEXT DEFAULT '',
-        online INTEGER DEFAULT 1,
-        device TEXT DEFAULT ''
+        content TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'تفضيل',
+        source TEXT NOT NULL DEFAULT 'اختيار المستخدم',
+        created_at TEXT NOT NULL
     )""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS contacts(
-        user_id INTEGER,
-        contact_id INTEGER,
-        UNIQUE(user_id,contact_id)
-    )""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS messages(
+    c.execute("""CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender INTEGER,
-        receiver INTEGER,
-        text TEXT,
-        read INTEGER DEFAULT 0,
-        edited INTEGER DEFAULT 0,
-        deleted INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+        text TEXT NOT NULL,
+        created_at TEXT NOT NULL
     )""")
-
+    c.execute("""CREATE TABLE IF NOT EXISTS consents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        version TEXT NOT NULL,
+        accepted_at TEXT NOT NULL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS research_sources (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        url TEXT NOT NULL UNIQUE,
+        summary TEXT NOT NULL,
+        category TEXT NOT NULL
+    )""")
+    c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('profile','{}')")
+    for item in RESEARCH:
+        c.execute("""INSERT OR IGNORE INTO research_sources(title,url,summary,category)
+                     VALUES(?,?,?,?)""", (item["title"], item["url"], item["summary"], item["category"]))
     c.commit()
     return c
+
+
+def rows(c, query, args=()):
+    return [dict(x) for x in c.execute(query, args).fetchall()]
+
+
+def profile(c):
+    raw = c.execute("SELECT value FROM settings WHERE key='profile'").fetchone()
+    try:
+        value = json.loads(raw[0]) if raw else {}
+    except Exception:
+        value = {}
+    return {
+        "name": value.get("name", "صاحب NEXA"),
+        "tone": value.get("tone", "واضح وعملي"),
+        "goal": value.get("goal", "مساعد شخصي يفهمني ويحترم خصوصيتي")
+    }
+
+
+def has_consent(c):
+    return c.execute("SELECT 1 FROM consents WHERE version='1' LIMIT 1").fetchone() is not None
+
+
+def json_body(handler):
+    try:
+        length = min(int(handler.headers.get("Content-Length", "0")), 200000)
+        return json.loads(handler.rfile.read(length).decode("utf-8")) if length else {}
+    except Exception:
+        return {}
+
+
+def send(handler, payload, status=200):
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def system_prompt(c):
+    p = profile(c)
+    mem = rows(c, "SELECT content,category FROM memories ORDER BY id DESC LIMIT ?", (MEMORY_LIMIT,))
+    memories = "\n".join(f"- [{m['category']}] {m['content']}" for m in reversed(mem)) or "لا توجد ذكريات محفوظة بعد."
+    sources = "\n".join(f"- {s['title']}: {s['summary']}" for s in rows(c, "SELECT title,summary FROM research_sources ORDER BY id"))
+    return f"""أنت NEXA، مساعد شخصي خاص بالمستخدم.
+
+هوية المستخدم وتفضيلاته الحالية:
+- الاسم: {p['name']}
+- النبرة المفضلة: {p['tone']}
+- الهدف: {p['goal']}
+
+ذكريات اختار المستخدم حفظها بنفسه:
+{memories}
+
+مبادئ سلوكية آمنة استخدمها عند الحاجة:
+{sources}
+
+قواعد مهمة:
+1. أجب بالعربية ما لم يطلب المستخدم لغة أخرى، وبأسلوب {p['tone']}.
+2. افهم السياق واسأل سؤالًا توضيحيًا واحدًا عند الضرورة، ولا تتظاهر بأنك تعرف ما لا تعرفه.
+3. لا تقل إنك شخص حقيقي، ولا تدّعي تشخيص الشخصية أو المرض النفسي. صغ التحليل كاحتمال قابل للتصحيح: 'قد يبدو من كلامك...'.
+4. لا تحفظ أي معلومة جديدة تلقائيًا. إذا ظهرت معلومة مفيدة، اقترح: 'هل تريد حفظها كذكرى؟' واترك القرار للمستخدم.
+5. في الطب والقانون والمال والأزمات النفسية، قدّم معلومات عامة ووجّه إلى مختص أو خدمات الطوارئ المناسبة بدل إصدار قرار حاسم.
+6. لا تستخدم الذكريات لاستنتاج الدين أو الصحة أو السياسة أو الجنس أو الأصل أو أي سمة حساسة.
+7. عند تقديم بحث، ميّز بين المعرفة العامة والاستنتاج، واذكر المصدر إن كان من المصادر المرفقة.
+8. هدفك دعم استقلالية المستخدم وكفاءته، لا التحكم به أو دفعه إلى قرار.
+"""
+
+
+def local_answer(text, c):
+    p = profile(c)
+    memories = rows(c, "SELECT content,category FROM memories ORDER BY id DESC LIMIT 5")
+    lower = text.lower()
+    if any(x in lower for x in ["من أنا", "شخصيتي", "حللني", "حلل شخصيتي"]):
+        if memories:
+            points = "، ".join(m["content"] for m in memories[:3])
+            return f"أقدر أصف تفضيلاتك الحالية فقط، وليس تشخيص شخصيتك. مما اخترت حفظه يظهر اهتمامك بـ: {points}. هذا وصف قابل للتعديل وليس حكمًا نهائيًا."
+        return "لا أملك ذكريات محفوظة عنك بعد. تحدث معي، ثم اختر بنفسك ما تريد حفظه؛ لن أبني تشخيصًا نفسيًا من محادثة قصيرة."
+    if any(x in lower for x in ["تذكر", "احفظ", "ذاكرة"]):
+        return "أستطيع حفظ المعلومة فقط عندما تختار ذلك من زر حفظ الذكرى. بهذه الطريقة يبقى التعلم تحت سيطرتك."
+    return f"أنا NEXA، مساعدك الشخصي. فهمت رسالتك: «{text[:240]}». أستطيع مساعدتك في تنظيم الفكرة وتحويلها إلى خطوات. فعّل AI_API_KEY في إعدادات التشغيل للحصول على ردود نموذج لغوي كاملة؛ حاليًا أعمل في الوضع المحلي الآمن."
+
+
+def call_ai(messages, c):
+    if not AI_KEY:
+        return local_answer(messages[-1]["content"], c), False
+    payload = {
+        "model": AI_MODEL,
+        "messages": messages,
+        "temperature": 0.35,
+        "max_tokens": 1200
+    }
+    req = urllib.request.Request(
+        AI_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {AI_KEY}"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        answer = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        return (answer or local_answer(messages[-1]["content"], c)), True
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError):
+        return "تعذر الاتصال بخدمة الذكاء الاصطناعي الآن. لم أفقد رسالتك؛ جرّب مرة أخرى أو راجع إعدادات AI_API_URL وAI_API_KEY.", False
 
 
 HTML = r'''<!doctype html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#07131a">
-<title>NEXA Chat</title>
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#08121d">
+<title>NEXA | مساعدي الشخصي</title>
 <style>
-*{box-sizing:border-box}
-
-:root{
- --bg:#07131a;
- --panel:#101c23;
- --panel2:#16252d;
- --bubble:#1d3039;
- --mine:#075e54;
- --accent:#22d3a1;
- --accent2:#17b98a;
- --text:#f2f7f8;
- --muted:#8ca0a9;
- --line:#263840;
- --danger:#ef5350;
-}
-
-body.light{
- --bg:#eef3f5;
- --panel:#ffffff;
- --panel2:#e8eef1;
- --bubble:#edf2f4;
- --mine:#d5f8e9;
- --accent:#0eaf83;
- --accent2:#078b69;
- --text:#142027;
- --muted:#63747d;
- --line:#d9e1e5;
-}
-
-*{scrollbar-width:thin}
-
-body{
- margin:0;
- height:100vh;
- overflow:hidden;
- background:var(--bg);
- color:var(--text);
- font-family:Arial,"Noto Sans Arabic",sans-serif;
-}
-
-button,input,textarea,select{font:inherit}
-
-button{cursor:pointer}
-
-.app{
- height:100vh;
- display:flex;
-}
-
-.sidebar{
- width:380px;
- min-width:320px;
- background:var(--panel);
- border-left:1px solid var(--line);
- display:flex;
- flex-direction:column;
- z-index:3;
-}
-
-.top{
- min-height:72px;
- background:var(--panel2);
- padding:12px 18px;
- display:flex;
- align-items:center;
- justify-content:space-between;
- gap:12px;
-}
-
-.logo{
- font-size:26px;
- font-weight:900;
- letter-spacing:1px;
- color:var(--accent);
-}
-
-.brand{
- display:flex;
- align-items:center;
- gap:10px;
-}
-
-.logoIcon{
- width:40px;
- height:40px;
- border-radius:13px;
- display:grid;
- place-items:center;
- background:linear-gradient(135deg,var(--accent),#087f69);
- color:#06251e;
- font-weight:900;
-}
-
-.small{
- color:var(--muted);
- font-size:12px;
- margin-top:4px;
-}
-
-.actions{
- display:flex;
- gap:7px;
- align-items:center;
-}
-
-.icon{
- width:42px;
- height:42px;
- border:0;
- border-radius:13px;
- background:transparent;
- color:var(--text);
- font-size:21px;
-}
-
-.icon:hover{
- background:var(--bubble);
-}
-
-.add{
- width:44px;
- height:44px;
- border:0;
- border-radius:14px;
- background:var(--accent);
- color:#04251d;
- font-size:25px;
- font-weight:bold;
-}
-
-.search{
- padding:12px;
-}
-
-.searchBox{
- display:flex;
- align-items:center;
- gap:8px;
- padding:0 12px;
- background:var(--bubble);
- border-radius:14px;
-}
-
-.searchBox span{
- color:var(--muted);
-}
-
-.searchBox input{
- width:100%;
- border:0;
- outline:0;
- background:transparent;
- color:var(--text);
- padding:13px 3px;
-}
-
-.list{
- overflow:auto;
- flex:1;
-}
-
-.person{
- padding:14px 16px;
- border-bottom:1px solid var(--line);
- display:flex;
- align-items:center;
- gap:12px;
- cursor:pointer;
- transition:.15s;
-}
-
-.person:hover{
- background:var(--panel2);
-}
-
-.avatar{
- width:52px;
- height:52px;
- min-width:52px;
- border-radius:50%;
- background:linear-gradient(135deg,#0b8f7b,#116b76);
- display:grid;
- place-items:center;
- font-size:23px;
- overflow:hidden;
-}
-
-.personInfo{
- min-width:0;
- flex:1;
-}
-
-.name{
- font-weight:800;
-}
-
-.preview{
- color:var(--muted);
- font-size:13px;
- margin-top:6px;
- white-space:nowrap;
- overflow:hidden;
- text-overflow:ellipsis;
-}
-
-.emptyList{
- text-align:center;
- color:var(--muted);
- padding:45px 20px;
- line-height:1.8;
-}
-
-.main{
- flex:1;
- min-width:0;
- display:flex;
- flex-direction:column;
- background:var(--bg);
-}
-
-.chatTop{
- display:flex;
- align-items:center;
- gap:10px;
-}
-
-.chatInfo{
- min-width:0;
-}
-
-.chatName{
- font-weight:800;
- white-space:nowrap;
- overflow:hidden;
- text-overflow:ellipsis;
-}
-
-.messages{
- flex:1;
- overflow:auto;
- padding:25px;
- background:
- radial-gradient(circle at 20% 20%,#ffffff05 1px,transparent 1px),
- radial-gradient(circle at 70% 70%,#ffffff04 1px,transparent 1px);
- background-size:28px 28px;
-}
-
-.emptyChat{
- height:100%;
- display:grid;
- place-items:center;
- text-align:center;
- color:var(--muted);
-}
-
-.emptyCard{
- max-width:420px;
- padding:30px;
-}
-
-.emptyLogo{
- width:85px;
- height:85px;
- margin:auto;
- border-radius:28px;
- display:grid;
- place-items:center;
- font-size:40px;
- background:linear-gradient(135deg,var(--accent),#087f69);
- color:#05271f;
-}
-
-.msgRow{
- display:flex;
- margin:7px 0;
-}
-
-.msgRow.me{
- justify-content:flex-start;
-}
-
-.msgRow.other{
- justify-content:flex-end;
-}
-
-.msg{
- max-width:min(70%,650px);
- background:var(--bubble);
- padding:10px 13px;
- border-radius:15px;
- box-shadow:0 2px 5px #0002;
- word-wrap:break-word;
-}
-
-.msgRow.me .msg{
- background:var(--mine);
-}
-
-.msgText{
- white-space:pre-wrap;
- line-height:1.45;
-}
-
-.meta{
- color:var(--muted);
- font-size:10px;
- margin-top:5px;
- text-align:left;
- direction:ltr;
-}
-
-.composer{
- padding:12px;
- background:var(--panel2);
- display:flex;
- gap:9px;
-}
-
-.composer input{
- flex:1;
- min-width:0;
- border:0;
- outline:0;
- padding:14px 17px;
- border-radius:16px;
- background:var(--bubble);
- color:var(--text);
-}
-
-.send{
- width:52px;
- height:52px;
- border:0;
- border-radius:16px;
- background:var(--accent);
- color:#06251e;
- font-size:21px;
- font-weight:bold;
-}
-
-.back{
- display:none;
-}
-
-.modal{
- display:none;
- position:fixed;
- inset:0;
- background:#0009;
- align-items:center;
- justify-content:center;
- z-index:50;
- padding:18px;
-}
-
-.modal.show{
- display:flex;
-}
-
-.modalBox{
- width:100%;
- max-width:430px;
- max-height:90vh;
- overflow:auto;
- background:var(--panel);
- border:1px solid var(--line);
- border-radius:25px;
- padding:24px;
- box-shadow:0 25px 80px #0008;
-}
-
-.modalBox h2{
- margin:0 0 7px;
-}
-
-.field{
- margin-top:12px;
-}
-
-.field label{
- display:block;
- color:var(--muted);
- font-size:13px;
- margin-bottom:6px;
-}
-
-.modalBox input,
-.modalBox textarea,
-.modalBox select{
- width:100%;
- border:0;
- outline:0;
- border-radius:13px;
- padding:14px;
- background:var(--bubble);
- color:var(--text);
-}
-
-.modalBox textarea{
- resize:vertical;
- min-height:90px;
-}
-
-.primary{
- width:100%;
- margin-top:14px;
- padding:14px;
- border:0;
- border-radius:14px;
- background:var(--accent);
- color:#05271f;
- font-weight:800;
-}
-
-.secondary{
- width:100%;
- margin-top:9px;
- padding:14px;
- border:0;
- border-radius:14px;
- background:var(--bubble);
- color:var(--text);
-}
-
-.danger{
- background:var(--danger);
- color:white;
-}
-
-.countryRow{
- display:flex;
- gap:8px;
-}
-
-.countryRow select{
- width:42%;
-}
-
-.countryRow input{
- width:58%;
-}
-
-.profile{
- text-align:center;
- margin-bottom:20px;
-}
-
-.profile .avatar{
- width:82px;
- height:82px;
- margin:0 auto 10px;
- font-size:34px;
-}
-
-.settingRow{
- display:flex;
- align-items:center;
- justify-content:space-between;
- padding:15px 2px;
- border-bottom:1px solid var(--line);
-}
-
-.settingText b{
- display:block;
-}
-
-.settingText span{
- color:var(--muted);
- font-size:12px;
-}
-
-.switch{
- width:45px;
- height:24px;
- accent-color:var(--accent);
-}
-
-.loginPage{
- position:fixed;
- inset:0;
- z-index:100;
- background:
- radial-gradient(circle at 20% 20%,#1b806e33,transparent 35%),
- radial-gradient(circle at 80% 80%,#22d3a122,transparent 35%),
- var(--bg);
- display:none;
- align-items:center;
- justify-content:center;
- padding:20px;
-}
-
-.loginPage.show{
- display:flex;
-}
-
-.loginCard{
- width:100%;
- max-width:430px;
- background:var(--panel);
- border:1px solid var(--line);
- border-radius:30px;
- padding:30px;
- box-shadow:0 30px 100px #0008;
-}
-
-.loginBrand{
- text-align:center;
- margin-bottom:25px;
-}
-
-.loginBrand .logoIcon{
- margin:auto;
- width:70px;
- height:70px;
- border-radius:22px;
- font-size:28px;
-}
-
-.loginBrand .logo{
- margin-top:12px;
- font-size:34px;
-}
-
-.loginBrand p{
- color:var(--muted);
-}
-
-.note{
- color:var(--muted);
- font-size:11px;
- line-height:1.6;
- text-align:center;
- margin-top:13px;
-}
-
-.toast{
- position:fixed;
- bottom:25px;
- left:50%;
- transform:translateX(-50%) translateY(20px);
- background:#13242b;
- color:white;
- padding:12px 18px;
- border-radius:14px;
- opacity:0;
- pointer-events:none;
- transition:.2s;
- z-index:200;
-}
-
-.toast.show{
- opacity:1;
- transform:translateX(-50%) translateY(0);
-}
-
-@media(max-width:700px){
-
- .sidebar{
-  width:100%;
-  min-width:0;
- }
-
- .main{
-  display:none;
- }
-
- .app.chatOpen .sidebar{
-  display:none;
- }
-
- .app.chatOpen .main{
-  display:flex;
- }
-
- .back{
-  display:block;
- }
-
- .msg{
-  max-width:86%;
- }
-
- .messages{
-  padding:16px;
- }
-
- .top{
-  min-height:66px;
- }
-
- .loginCard{
-  padding:23px;
- }
-}
-
-@media(min-width:701px){
- .main{
-  display:flex!important;
- }
-}
-</style>
-</head>
-
+:root{--bg:#07111b;--panel:#0e1c2a;--panel2:#132638;--line:#24384a;--text:#eef7fb;--muted:#91a8b8;--accent:#49e0b0;--accent2:#2ab896;--bubble:#172c3b;--mine:#135c55;--danger:#ff7373;--shadow:0 20px 60px #0004}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,#103b49 0,#07111b 38%);color:var(--text);font-family:Arial,"Noto Sans Arabic",sans-serif;height:100vh}button,input,textarea{font:inherit}button{cursor:pointer;border:0}.app{height:100vh;display:grid;grid-template-columns:300px 1fr;max-width:1500px;margin:auto}.side{background:#0b1926dd;border-left:1px solid var(--line);padding:22px;display:flex;flex-direction:column;gap:20px}.brand{display:flex;align-items:center;gap:12px}.mark{width:45px;height:45px;display:grid;place-items:center;border-radius:15px;background:linear-gradient(135deg,var(--accent),#1a7f88);color:#05231e;font-size:21px;font-weight:900}.brand b{font-size:22px}.brand small{display:block;color:var(--muted);margin-top:3px}.nav{display:grid;gap:8px}.nav button{background:transparent;color:var(--muted);text-align:right;padding:13px 14px;border-radius:12px}.nav button.active,.nav button:hover{background:var(--panel2);color:var(--text)}.tip{margin-top:auto;border:1px solid var(--line);border-radius:16px;padding:15px;color:var(--muted);font-size:13px;line-height:1.7}.content{min-width:0;display:flex;flex-direction:column}.head{height:78px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#091824aa}.head h1{font-size:20px;margin:0}.head p{color:var(--muted);font-size:12px;margin:5px 0 0}.badge{background:#123c38;color:var(--accent);border:1px solid #246859;padding:7px 11px;border-radius:30px;font-size:12px}.view{display:none;height:calc(100vh - 78px);padding:25px;overflow:auto}.view.active{display:block}.chat{display:flex;flex-direction:column;min-height:100%;max-width:920px;margin:auto}.messages{flex:1;display:flex;flex-direction:column;gap:13px;padding-bottom:18px}.welcome{margin:auto;max-width:610px;text-align:center;padding:30px}.welcome .orb{font-size:48px;margin-bottom:10px}.welcome h2{font-size:30px;margin:7px 0}.welcome p{color:var(--muted);line-height:1.8}.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:20px}.chip{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:25px;padding:9px 13px}.msg{max-width:78%;padding:14px 16px;border:1px solid var(--line);border-radius:18px;line-height:1.75;white-space:pre-wrap;box-shadow:0 8px 25px #0002}.msg.user{align-self:flex-start;background:var(--mine);border-bottom-left-radius:5px}.msg.assistant{align-self:flex-end;background:var(--bubble);border-bottom-right-radius:5px}.meta{font-size:11px;color:var(--muted);margin-top:5px}.save{background:transparent;color:var(--accent);font-size:11px;padding:0;margin-top:7px}.composer{display:flex;gap:10px;align-items:flex-end;padding-top:12px;border-top:1px solid var(--line)}textarea{width:100%;resize:none;min-height:52px;max-height:150px;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:16px;padding:14px;outline:0}textarea:focus{border-color:var(--accent)}.send{background:var(--accent);color:#05231e;border-radius:15px;padding:14px 19px;font-weight:bold;height:52px}.send:disabled{opacity:.5}.panel{max-width:900px;margin:auto}.panel h2{margin-top:0}.sub{color:var(--muted);line-height:1.8}.card{background:#0e1c2aee;border:1px solid var(--line);border-radius:18px;padding:18px;margin:12px 0;box-shadow:var(--shadow)}.memory{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.memory b{display:block;color:var(--accent);font-size:12px;margin-bottom:6px}.memory p{margin:0;line-height:1.6}.delete{background:transparent;color:var(--danger);font-size:18px}.form{display:grid;gap:10px;margin:16px 0}.form input{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:13px;outline:0}.primary{background:var(--accent);color:#05231e;border-radius:12px;padding:12px 17px;font-weight:bold}.source{display:flex;gap:14px;align-items:flex-start}.source .icon2{font-size:24px}.source h3{font-size:16px;margin:0 0 7px}.source p{color:var(--muted);line-height:1.7;margin:0 0 8px}.source a{color:var(--accent);font-size:12px}.overlay{position:fixed;inset:0;background:#020810dd;backdrop-filter:blur(8px);display:none;place-items:center;padding:20px;z-index:10}.overlay.show{display:grid}.consent{max-width:550px;background:var(--panel);border:1px solid #35536a;border-radius:22px;padding:27px;box-shadow:var(--shadow)}.consent h2{margin-top:0}.consent p,.consent li{color:var(--muted);line-height:1.8}.check{display:flex;gap:10px;align-items:flex-start;margin:20px 0}.check input{accent-color:var(--accent);margin-top:6px}.empty{color:var(--muted);text-align:center;padding:30px}@media(max-width:780px){.app{display:block}.side{height:auto;padding:12px 15px;border-left:0;border-bottom:1px solid var(--line)}.brand{justify-content:center}.nav{display:flex;overflow:auto}.nav button{white-space:nowrap}.tip{display:none}.content{height:calc(100vh - 135px)}.head{padding:0 15px}.view{height:calc(100vh - 213px);padding:15px}.msg{max-width:90%}.welcome h2{font-size:24px}}
+</style></head>
 <body>
-
-<div class="app" id="app">
-
-<aside class="sidebar">
-
-<div class="top">
-
-<div class="brand">
-<div class="logoIcon">N</div>
-<div>
-<div class="logo">NEXA</div>
-<div class="small" id="myNumber">غير مسجل</div>
-</div>
-</div>
-
-<div class="actions">
-<button class="icon" onclick="openSettings()">⚙️</button>
-<button class="add" onclick="openAdd()">+</button>
-</div>
-
-</div>
-
-<div class="search">
-<div class="searchBox">
-<span>🔎</span>
-<input id="search" placeholder="بحث في المحادثات..." oninput="filterContacts(this.value)">
-</div>
-</div>
-
-<div class="list" id="contacts"></div>
-
-</aside>
-
-<main class="main">
-
-<div class="top">
-
-<div class="chatTop">
-
-<button class="icon back" onclick="goBack()">‹</button>
-
-<div class="avatar" id="chatAvatar">💬</div>
-
-<div class="chatInfo">
-<div class="chatName" id="title">NEXA Chat</div>
-<div class="small" id="status">اختر محادثة للبدء</div>
-</div>
-
-</div>
-
-<button class="icon" onclick="chatMenu()">⋮</button>
-
-</div>
-
-<div class="messages" id="messages">
-
-<div class="emptyChat">
-
-<div class="emptyCard">
-<div class="emptyLogo">N</div>
-<h2>مرحبًا بك في NEXA 🚀</h2>
-<p>محادثاتك، جهات اتصالك وبروفايلك في مكان واحد.</p>
-<p>اضغط <b>+</b> لإضافة شخص والبدء.</p>
-</div>
-
-</div>
-
-</div>
-
-<div class="composer">
-<input id="text" placeholder="اكتب رسالة..." autocomplete="off"
-onkeydown="if(event.key==='Enter')sendMessage()">
-<button class="send" onclick="sendMessage()">➤</button>
-</div>
-
-</main>
-
-</div>
-
-
-<div class="loginPage" id="loginPage">
-
-<div class="loginCard">
-
-<div class="loginBrand">
-
-<div class="logoIcon">N</div>
-
-<div class="logo">NEXA</div>
-
-<p>تواصل بطريقة مختلفة.</p>
-
-</div>
-
-<div class="field">
-<label>الدولة</label>
-
-<div class="countryRow">
-
-<select id="country">
-<option value="+212">🇲🇦 المغرب +212</option>
-<option value="+966">🇸🇦 السعودية +966</option>
-<option value="+213">🇩🇿 الجزائر +213</option>
-<option value="+216">🇹🇳 تونس +216</option>
-<option value="+33">🇫🇷 فرنسا +33</option>
-<option value="+44">🇬🇧 بريطانيا +44</option>
-<option value="+1">🇺🇸 أمريكا/كندا +1</option>
-<option value="+34">🇪🇸 إسبانيا +34</option>
-<option value="+49">🇩🇪 ألمانيا +49</option>
-<option value="+39">🇮🇹 إيطاليا +39</option>
-<option value="+90">🇹🇷 تركيا +90</option>
-<option value="+971">🇦🇪 الإمارات +971</option>
-</select></select>
-
-<input id="phone" inputmode="numeric"
-placeholder="رقم الهاتف">
-</div>
-</div>
-
-<div class="field">
-<label>اسمك</label>
-<input id="name" maxlength="40" placeholder="اكتب اسمك">
-</div>
-
-<button class="primary" onclick="login()">دخول إلى NEXA 🚀</button>
-
-<div class="note">
-هذا نظام NEXA مستقل وليس تسجيل دخول إلى WhatsApp.
-لا تدخل كلمة مرور أو رمز WhatsApp هنا.
-</div>
-
-</div>
-
-</div>
-
-
-<div class="modal" id="modal">
-<div class="modalBox" id="modalContent"></div>
-</div>
-
-<div class="toast" id="toast"></div>
-
-
+<div class="app">
+<aside class="side"><div class="brand"><div class="mark">N</div><div><b>NEXA</b><small>مساعدك الشخصي</small></div></div>
+<nav class="nav"><button class="active" data-view="chat">💬 المحادثة</button><button data-view="memories">🧠 ذاكرتي</button><button data-view="research">📚 مصادر علمية</button></nav>
+<div class="tip">يتعلم NEXA فقط من المعلومات التي تختار حفظها. يمكنك حذفها في أي وقت، ولن يحوّل كلامك إلى تشخيص نفسي.</div></aside>
+<main class="content"><header class="head"><div><h1 id="title">محادثة خاصة</h1><p id="subtitle">مساحة شخصية لك وحدك</p></div><span class="badge" id="status">الوضع المحلي</span></header>
+<section class="view active" id="view-chat"><div class="chat"><div class="messages" id="messages"></div><form class="composer" id="composer"><textarea id="input" rows="1" placeholder="اكتب ما تفكر فيه..."></textarea><button class="send" id="send" type="submit">إرسال</button></form></div></section>
+<section class="view" id="view-memories"><div class="panel"><h2>ذاكرتي</h2><p class="sub">أضف تفضيلات أو أهدافًا تريد أن يستخدمها NEXA. لا تضف معلومات حساسة لا تحتاجها.</p><form class="form" id="memory-form"><input id="memory" maxlength="300" placeholder="مثال: أفضل الإجابات المختصرة مع خطوات عملية" required><input id="category" maxlength="40" value="تفضيل" placeholder="التصنيف"><button class="primary">حفظ الذكرى</button></form><div id="memory-list"></div></div></section>
+<section class="view" id="view-research"><div class="panel"><h2>مصادر علمية مختارة</h2><p class="sub">هذه المراجع تساعد NEXA على استخدام مبادئ عامة بحذر. لا تُستخدم لتشخيصك أو إصدار حكم نهائي على شخصيتك.</p><div id="research-list"></div></div></section>
+</main></div>
+<div class="overlay" id="consent"><div class="consent"><h2>قبل أن نبدأ</h2><p>هذا مساعد ذكاء اصطناعي شخصي. لكي يعمل، اقرأ ووافق:</p><ul><li>الردود آلية وقد تكون غير دقيقة.</li><li>تحليل الشخصية تقريبي وليس تشخيصًا طبيًا أو نفسيًا.</li><li>لا تعتمد عليه وحده في القرارات الطبية أو القانونية أو المالية.</li><li>لن يحفظ NEXA معلومة كذكرى إلا باختيارك، ويمكنك حذفها.</li></ul><label class="check"><input type="checkbox" id="agree"><span>أفهم هذه الحدود وأوافق على استخدام المساعد.</span></label><button class="primary" id="accept" disabled>أوافق وأبدأ</button></div></div>
 <script>
-
-const COUNTRIES = [
-["+212","🇲🇦","المغرب"],
-["+966","🇸🇦","السعودية"],
-["+213","🇩🇿","الجزائر"],
-["+216","🇹🇳","تونس"],
-["+20","🇪🇬","مصر"],
-["+971","🇦🇪","الإمارات"],
-["+974","🇶🇦","قطر"],
-["+965","🇰🇼","الكويت"],
-["+973","🇧🇭","البحرين"],
-["+968","🇴🇲","عمان"],
-["+962","🇯🇴","الأردن"],
-["+33","🇫🇷","فرنسا"],
-["+44","🇬🇧","بريطانيا"],
-["+1","🇺🇸","أمريكا/كندا"],
-["+34","🇪🇸","إسبانيا"],
-["+49","🇩🇪","ألمانيا"],
-["+39","🇮🇹","إيطاليا"],
-["+90","🇹🇷","تركيا"],
-["+31","🇳🇱","هولندا"],
-["+32","🇧🇪","بلجيكا"],
-["+41","🇨🇭","سويسرا"],
-["+351","🇵🇹","البرتغال"],
-["+7","🇷🇺","روسيا"],
-["+81","🇯🇵","اليابان"],
-["+82","🇰🇷","كوريا الجنوبية"],
-["+86","🇨🇳","الصين"],
-["+91","🇮🇳","الهند"],
-["+61","🇦🇺","أستراليا"],
-["+55","🇧🇷","البرازيل"]
-];
-
-let me=null;
-let current=null;
-let contacts=[];
-let lastMessageId=0;
-
-
-function $(id){
- return document.getElementById(id);
-}
-
-
-function toast(text){
- const t=$("toast");
- t.textContent=text;
- t.classList.add("show");
- setTimeout(()=>t.classList.remove("show"),2200);
-}
-
-
-function esc(x){
- return String(x ?? "").replace(/[&<>"']/g,c=>({
-  "&":"&amp;",
-  "<":"&lt;",
-  ">":"&gt;",
-  '"':"&quot;",
-  "'":"&#039;"
- }[c]));
-}
-
-
-function device(){
- const u=navigator.userAgent;
-
- if(/Android/i.test(u))return "Android";
- if(/iPhone|iPad|iPod/i.test(u))return "iPhone/iPad";
- if(/Windows/i.test(u))return "Windows";
- if(/Macintosh/i.test(u))return "macOS";
- if(/Linux/i.test(u))return "Linux";
-
- return "جهاز";
-}
-
-
-async function api(url,opt={}){
- try{
-  const r=await fetch(url,opt);
-  return await r.json();
- }catch(e){
-  toast("تعذر الاتصال بالسيرفر");
-  return {ok:false,error:"connection"};
- }
-}
-
-
-function fillCountries(){
-
- $("country").innerHTML=COUNTRIES.map(c=>
-  `<option value="${c[0]}">${c[1]} ${c[2]} ${c[0]}</option>`
- ).join("");
-
- $("addCountry").innerHTML=COUNTRIES.map(c=>
-  `<option value="${c[0]}">${c[1]} ${c[2]} ${c[0]}</option>`
- ).join("");
-}
-
-
-function showLogin(){
-
- $("loginPage").classList.add("show");
-
- const saved=localStorage.getItem("nexa_session");
-
- if(saved){
-  try{
-   const x=JSON.parse(saved);
-   $("phone").value=x.phone?.replace(/^\\+212/,"") || "";
-   $("name").value=x.name || "";
-  }catch(e){}
- }
-}
-
-
-async function login(){
-
- let code=$("country").value;
- let phone=$("phone").value.replace(/\D/g,"");
- let name=$("name").value.trim();
-
- if(!/^\d+$/.test(phone) || phone.length<6 || phone.length>12){
-  toast("أدخل رقم هاتف صحيح");
-  return;
- }
-
- if(!name || name.length<2){
-  toast("أدخل اسمك");
-  return;
- }
-
- const d=await api("/api/login",{
-  method:"POST",
-  headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({
-   phone:code+phone,
-   name:name,
-   device:device()
-  })
- });
-
- if(!d.ok){
-  toast(d.error || "فشل تسجيل الدخول");
-  return;
- }
-
- me=d.user;
-
- localStorage.setItem("nexa_session",JSON.stringify(me));
-
- $("loginPage").classList.remove("show");
-
- updateMe();
- loadContacts();
-
- toast("مرحبًا "+me.name+" 👋");
-}
-
-
-function updateMe(){
-
- $("myNumber").textContent=
- me.phone+" • "+me.device;
-
-}
-
-
-async function restore(){
-  // لا تدخل مباشرة للحساب القديم عند فتح الموقع
-  localStorage.removeItem("nexa_session");
-
-  me=null;
-  current=null;
-
-  const page=document.getElementById("loginPage");
-  if(page) page.classList.add("show");
-
-  // تنظيف واجهة المحادثات
-  const contacts=document.getElementById("contacts");
-  if(contacts) contacts.innerHTML="";
-
-  const messages=document.getElementById("messages");
-  if(messages){
-    messages.innerHTML=`
-      <div class="empty">
-        <h2>مرحباً في NEXA 🚀</h2>
-        <p>سجّل دخولك للبدء</p>
-      </div>`;
-  }
-}
-
-async function loadContacts(){
-
- if(!me)return;
-
- const d=await api("/api/contacts?user="+me.id);
-
- if(!d.contacts){
-  contacts=[];
- }else{
-  contacts=d.contacts;
- }
-
- renderContacts(contacts);
-
-}
-
-
-function renderContacts(list){
-
- if(!list.length){
-
-  $("contacts").innerHTML=`
-  <div class="emptyList">
-  لا توجد محادثات بعد<br>
-  اضغط <b>+</b> لإضافة رقم
-  </div>`;
-
-  return;
- }
-
- $("contacts").innerHTML=list.map(x=>`
-
- <div class="person" onclick="openChat(${x.id})">
-
-  <div class="avatar">${esc(x.avatar || "👤")}</div>
-
-  <div class="personInfo">
-
-   <div class="name">${esc(x.name)}</div>
-
-   <div class="preview">
-   ${esc(x.bio || x.phone)}
-   </div>
-
-  </div>
-
- </div>
-
- `).join("");
-
-}
-
-
-function filterContacts(q){
-
- q=q.toLowerCase();
-
- renderContacts(
-  contacts.filter(x=>
-   (x.name+" "+x.phone+" "+(x.bio||""))
-   .toLowerCase()
-   .includes(q)
-  )
- );
-
-}
-
-
-function openAdd(){
-
- $("modalContent").innerHTML=`
-
- <h2>➕ إضافة جهة اتصال</h2>
-
- <div class="field">
- <label>الدولة</label>
- <select id="addCountry"></select>
- </div>
-
- <div class="field">
- <label>رقم الهاتف</label>
- <input id="addPhone" inputmode="numeric"
- placeholder="أدخل الرقم بدون رمز الدولة">
- </div>
-
- <button class="primary" onclick="doAdd()">إضافة الشخص</button>
- <button class="secondary" onclick="closeModal()">إلغاء</button>
-
- `;
-
- $("modal").classList.add("show");
-
- $("addCountry").innerHTML=COUNTRIES.map(c=>
-  `<option value="${c[0]}">${c[1]} ${c[2]} ${c[0]}</option>`
- ).join("");
-
-}
-
-
-async function doAdd(){
-
- let code=$("addCountry").value;
- let phone=$("addPhone").value.replace(/\D/g,"");
-
- if(!/^\d+$/.test(phone) || phone.length<6 || phone.length>12){
-  toast("رقم غير صحيح");
-  return;
- }
-
- const d=await api("/api/add",{
-  method:"POST",
-  headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({
-   user:me.id,
-   phone:code+phone
-  })
- });
-
- if(!d.ok){
-  toast(d.error || "لم تتم الإضافة");
-  return;
- }
-
- closeModal();
- await loadContacts();
-
- toast("تمت إضافة جهة الاتصال ✅");
-
-}
-
-
-async function openChat(id){
-
- current=id;
-
- const x=contacts.find(a=>Number(a.id)===Number(id));
-
- if(!x)return;
-
- $("title").textContent=x.name;
- $("chatAvatar").textContent=x.avatar || "👤";
- $("status").textContent=x.online ? "متصل الآن" : "غير متصل";
-
- $("app").classList.add("chatOpen");
-
- await refreshMessages(true);
-
-}
-
-
-async function refreshMessages(force=false){
-
- if(!me || !current)return;
-
- const d=await api(
-  "/api/messages?me="+me.id+"&with="+current
- );
-
- if(!d.messages)return;
-
- const messages=d.messages;
-
- if(!force && messages.length===0)return;
-
- $("messages").innerHTML=messages.map(x=>{
-
-  const mine=Number(x.sender)===Number(me.id);
-
-  return `
-
-  <div class="msgRow ${mine?"me":"other"}">
-
-   <div class="msg">
-
-    <div class="msgText">
-    ${x.deleted ? "<i>تم حذف هذه الرسالة</i>" : esc(x.text)}
-    </div>
-
-    <div class="meta">
-    ${formatTime(x.created_at)}
-    ${mine ? (x.read ? " ✓✓" : " ✓") : ""}
-    </div>
-
-   </div>
-
-  </div>
-
-  `;
-
- }).join("");
-
- const box=$("messages");
- box.scrollTop=box.scrollHeight;
-
-}
-
-
-function formatTime(x){
-
- try{
-
-  return new Date(
-   String(x).replace(" ","T")+"Z"
-  ).toLocaleTimeString([],{
-   hour:"2-digit",
-   minute:"2-digit"
-  });
-
- }catch(e){
-
-  return "";
-
- }
-
-}
-
-
-async function sendMessage(){
-
- if(!current){
-  toast("اختر محادثة أولًا");
-  return;
- }
-
- const input=$("text");
- const text=input.value.trim();
-
- if(!text)return;
-
- input.disabled=true;
-
- const d=await api("/api/send",{
-  method:"POST",
-  headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({
-   sender:me.id,
-   receiver:current,
-   text:text
-  })
- });
-
- input.disabled=false;
-
- if(!d.ok){
-  toast(d.error || "تعذر إرسال الرسالة");
-  return;
- }
-
- input.value="";
-
- await refreshMessages(true);
-
-}
-
-
-function goBack(){
-
- $("app").classList.remove("chatOpen");
- current=null;
-
-}
-
-
-function closeModal(){
-
- $("modal").classList.remove("show");
-
-}
-
-
-function openSettings(){
-
- $("modalContent").innerHTML=`
-
- <h2>⚙️ إعدادات NEXA</h2>
-
- <div class="profile">
-
-  <div class="avatar">${esc(me.avatar||"👤")}</div>
-
-  <h3>${esc(me.name)}</h3>
-
-  <div class="small">${esc(me.phone)}</div>
-
- </div>
-
- <div class="settingRow">
-  <div class="settingText">
-   <b>🌙 الوضع الداكن</b>
-   <span>تغيير مظهر NEXA</span>
-  </div>
-  <input class="switch" type="checkbox"
-   ${document.body.classList.contains("light")?"":"checked"}
-   onchange="toggleTheme(this)">
- </div>
-
- <div class="settingRow">
-  <div class="settingText">
-   <b>📱 الجهاز</b>
-   <span>${esc(me.device)}</span>
-  </div>
- </div>
-
- <button class="primary" onclick="editProfile()">
- 👤 تعديل البروفايل
- </button>
-
- <button class="secondary" onclick="closeModal()">
- إغلاق
- </button>
-
- <button class="primary danger" onclick="logout()">
- 🚪 تسجيل الخروج
- </button>
-
- `;
-
- $("modal").classList.add("show");
-
-}
-
-
-function toggleTheme(el){
-
- document.body.classList.toggle("light",!el.checked);
-
- localStorage.setItem(
-  "nexa_theme",
-  el.checked ? "dark" : "light"
- );
-
-}
-
-
-function loadTheme(){
-
- const t=localStorage.getItem("nexa_theme");
-
- if(t==="light")
-  document.body.classList.add("light");
-
-}
-
-
-function editProfile(){
-
- $("modalContent").innerHTML=`
-
- <h2>👤 تعديل البروفايل</h2>
-
- <div class="field">
- <label>الاسم</label>
- <input id="editName" maxlength="40"
- value="${esc(me.name)}">
- </div>
-
- <div class="field">
- <label>النبذة</label>
- <textarea id="editBio">${esc(me.bio||"")}</textarea>
- </div>
-
- <div class="field">
- <label>الصورة الرمزية</label>
- <input id="editAvatar" maxlength="4"
- value="${esc(me.avatar||"👤")}">
- </div>
-
- <button class="primary" onclick="saveProfile()">
- حفظ التغييرات
- </button>
-
- <button class="secondary" onclick="openSettings()">
- رجوع
- </button>
-
- `;
-
-}
-
-
-async function saveProfile(){
-
- const name=$("editName").value.trim();
- const bio=$("editBio").value.trim();
- const avatar=$("editAvatar").value.trim() || "👤";
-
- if(name.length<2){
-  toast("الاسم قصير جدًا");
-  return;
- }
-
- const d=await api("/api/profile",{
-  method:"POST",
-  headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({
-   id:me.id,
-   name:name,
-   bio:bio,
-   avatar:avatar
-  })
- });
-
- if(!d.ok){
-  toast(d.error || "فشل الحفظ");
-  return;
- }
-
- me=d.user;
-
- localStorage.setItem(
-  "nexa_session",
-  JSON.stringify(me)
- );
-
- updateMe();
- await loadContacts();
-
- closeModal();
-
- toast("تم حفظ البروفايل ✅");
-
-}
-
-
-function logout(){
-
- if(!confirm("هل تريد تسجيل الخروج؟"))return;
-
- localStorage.removeItem("nexa_session");
-
- location.reload();
-
-}
-
-
-function chatMenu(){
-
- if(!current)return;
-
- $("modalContent").innerHTML=`
-
- <h2>💬 خيارات المحادثة</h2>
-
- <button class="primary"
- onclick="refreshMessages(true);closeModal()">
- 🔄 تحديث
- </button>
-
- <button class="secondary"
- onclick="closeModal()">
- إلغاء
- </button>
-
- `;
-
- $("modal").classList.add("show");
-
-}
-
-
-$("modal").addEventListener("click",e=>{
- if(e.target===$("modal"))closeModal();
-});
-
-
-loadTheme();
-restore();
-
-
-setInterval(()=>{
-
- if(me && current)
-  refreshMessages(false);
-
-},1200);
-
-</script>
-
-</body>
-</html>
-'''
+const $=s=>document.querySelector(s);const state={messages:[],memories:[],research:[],consent:false};
+async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const d=await r.json();if(!r.ok)throw new Error(d.error||'حدث خطأ');return d}
+function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function show(view){document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===view));document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+view));const titles={chat:['محادثة خاصة','مساحة شخصية لك وحدك'],memories:['ذاكرتي','أنت تختار ما الذي يتعلمه NEXA عنك'],research:['مصادر علمية مختارة','مبادئ عامة، وليست تشخيصًا']};$('#title').textContent=titles[view][0];$('#subtitle').textContent=titles[view][1]}
+function renderMessages(){const box=$('#messages');if(!state.messages.length){box.innerHTML='<div class="welcome"><div class="orb">🧠</div><h2>مرحبًا، أنا NEXA</h2><p>مساعدك الشخصي لفهم الأفكار وتنظيمها. ابدأ برسالة، وإذا أردت أن أتذكر شيئًا اضغط «حفظ كذكرى» بنفسك.</p><div class="chips"><button class="chip" onclick="quick('ساعدني أنظم أهدافي')">تنظيم الأهداف</button><button class="chip" onclick="quick('كيف يمكن أن أفهم سلوكي دون تشخيص؟')">فهم السلوك</button></div></div>';return}box.innerHTML=state.messages.map(m=>'<div class="msg '+m.role+'"><div>'+esc(m.text)+'</div><div class="meta">'+(m.role==='user'?'أنت':'NEXA')+' · '+new Date(m.created_at).toLocaleTimeString('ar-MA',{hour:'2-digit',minute:'2-digit'})+'</div>'+(m.role==='user'?'<button class="save" onclick="saveText('+JSON.stringify(m.text)+')">＋ حفظ كذكرى</button>':'')+'</div>').join('');box.scrollTop=box.scrollHeight}
+function renderMemories(){const box=$('#memory-list');box.innerHTML=state.memories.length?state.memories.map(m=>'<div class="card memory"><div><b>'+esc(m.category)+'</b><p>'+esc(m.content)+'</p></div><button class="delete" onclick="removeMemory('+m.id+')">×</button></div>').join(''):'<div class="empty">لا توجد ذكريات محفوظة بعد.</div>'}
+function renderResearch(){ $('#research-list').innerHTML=state.research.map(s=>'<article class="card source"><div class="icon2">📖</div><div><h3>'+esc(s.title)+'</h3><p>'+esc(s.summary)+'</p><a href="'+esc(s.url)+'" target="_blank" rel="noreferrer">فتح المصدر ↗</a></div></article>').join('') }
+async function load(){const d=await api('/api/state');Object.assign(state,d);$('#status').textContent=d.ai_ready?'AI متصل':'وضع محلي';renderMessages();renderMemories();renderResearch();if(!d.consent)$('#consent').classList.add('show');else enable()}
+function enable(){$('#input').disabled=false;$('#send').disabled=false}
+async function sendMessage(text){text=(text||'').trim();if(!text||!state.consent)return;$('#input').value='';$('#send').disabled=true;state.messages.push({role:'user',text,created_at:new Date().toISOString()});renderMessages();try{const d=await api('/api/chat',{method:'POST',body:JSON.stringify({text})});state.messages.push(d.message);renderMessages()}catch(e){alert(e.message)}finally{$('#send').disabled=false;$('#input').focus()}}
+function quick(t){show('chat');sendMessage(t)}
+async function saveText(text){const category=prompt('تصنيف الذكرى؟','تفضيل');if(category===null)return;try{const d=await api('/api/memories',{method:'POST',body:JSON.stringify({content:text,category})});state.memories.unshift(d.memory);renderMemories();alert('تم حفظ الذكرى ويمكنك حذفها من قسم ذاكرتي.')}catch(e){alert(e.message)}}
+async function removeMemory(id){if(!confirm('حذف هذه الذكرى؟'))return;await api('/api/memories?id='+id,{method:'DELETE'});state.memories=state.memories.filter(m=>m.id!==id);renderMemories()}
+$('#composer').addEventListener('submit',e=>{e.preventDefault();sendMessage($('#input').value)});$('#input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#composer').requestSubmit()}});document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>show(b.dataset.view)));$('#agree').addEventListener('change',e=>$('#accept').disabled=!e.target.checked);$('#accept').addEventListener('click',async()=>{try{await api('/api/consent',{method:'POST',body:JSON.stringify({accepted:true})});state.consent=true;$('#consent').classList.remove('show');enable()}catch(e){alert(e.message)}});$('#memory-form').addEventListener('submit',async e=>{e.preventDefault();try{const d=await api('/api/memories',{method:'POST',body:JSON.stringify({content:$('#memory').value,category:$('#category').value})});state.memories.unshift(d.memory);$('#memory').value='';renderMemories()}catch(e){alert(e.message)}});load();
+</script></body></html>'''
 
 
 class Server(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
 
-    def send_json(self,data):
-
-        b=json.dumps(
-            data,
-            ensure_ascii=False
-        ).encode()
-
+    def send_html(self):
+        data = HTML.encode("utf-8")
         self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8"
-        )
-        self.send_header(
-            "Content-Length",
-            str(len(b))
-        )
-        self.send_header(
-            "Cache-Control",
-            "no-store"
-        )
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-
-        self.wfile.write(b)
-
-
-    def body(self):
-
-        try:
-            n=int(self.headers.get("Content-Length",0))
-            raw=self.rfile.read(n)
-
-            if not raw:
-                return {}
-
-            return json.loads(raw)
-
-        except:
-            return {}
-
+        self.wfile.write(data)
 
     def do_GET(self):
-
-        u=urlparse(self.path)
-        q=parse_qs(u.query)
-
-        c=conn()
-
-        if u.path=="/":
-
-            b=HTML.encode()
-
-            self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                "text/html; charset=utf-8"
-            )
-            self.send_header(
-                "Content-Length",
-                str(len(b))
-            )
-            self.end_headers()
-
-            self.wfile.write(b)
-            return
-
-
-        if u.path=="/api/session":
-
-            try:
-                uid=int(q.get("id",["0"])[0])
-            except:
-                uid=0
-
-            row=c.execute(
-                "SELECT * FROM users WHERE id=?",
-                (uid,)
-            ).fetchone()
-
-            if not row:
-                return self.send_json({
-                    "ok":False,
-                    "error":"الجلسة غير موجودة"
+        path = urlparse(self.path).path
+        c = db()
+        try:
+            if path == "/":
+                return self.send_html()
+            if path == "/api/state":
+                return send(self, {
+                    "consent": has_consent(c),
+                    "ai_ready": bool(AI_KEY),
+                    "profile": profile(c),
+                    "messages": rows(c, "SELECT id,role,text,created_at FROM messages ORDER BY id ASC LIMIT 100"),
+                    "memories": rows(c, "SELECT id,content,category,source,created_at FROM memories ORDER BY id DESC"),
+                    "research": rows(c, "SELECT id,title,url,summary,category FROM research_sources ORDER BY id")
                 })
-
-            c.execute(
-                "UPDATE users SET online=1 WHERE id=?",
-                (uid,)
-            )
-
-            c.commit()
-
-            return self.send_json({
-                "ok":True,
-                "user":dict(row)
-            })
-
-
-        if u.path=="/api/contacts":
-
-            try:
-                uid=int(q.get("user",["0"])[0])
-            except:
-                uid=0
-
-            rows=c.execute("""
-            SELECT u.*
-            FROM users u
-            JOIN contacts x
-            ON u.id=x.contact_id
-            WHERE x.user_id=?
-            ORDER BY u.name COLLATE NOCASE
-            """,(uid,)).fetchall()
-
-            return self.send_json({
-                "contacts":[dict(x) for x in rows]
-            })
-
-
-        if u.path=="/api/messages":
-
-            try:
-                a=int(q.get("me",["0"])[0])
-                b=int(q.get("with",["0"])[0])
-            except:
-                return self.send_json({
-                    "messages":[]
-                })
-
-            c.execute("""
-            UPDATE messages
-            SET read=1
-            WHERE sender=? AND receiver=?
-            """,(b,a))
-
-            c.commit()
-
-            rows=c.execute("""
-            SELECT *
-            FROM messages
-            WHERE
-            (sender=? AND receiver=?)
-            OR
-            (sender=? AND receiver=?)
-            ORDER BY id ASC
-            """,(a,b,b,a)).fetchall()
-
-            return self.send_json({
-                "messages":[dict(x) for x in rows]
-            })
-
-
-        self.send_response(404)
-        self.end_headers()
-
+            if path == "/api/export":
+                return send(self, {"profile": profile(c), "memories": rows(c, "SELECT * FROM memories"), "messages": rows(c, "SELECT * FROM messages"), "research": rows(c, "SELECT * FROM research_sources")})
+            return send(self, {"error": "غير موجود"}, 404)
+        finally:
+            c.close()
 
     def do_POST(self):
-
-        c=conn()
-        d=self.body()
-
-        if self.path=="/api/login":
-
-            phone=re.sub(
-                r"\D",
-                "",
-                str(d.get("phone",""))
-            )
-
-            name=str(
-                d.get("name","")
-            ).strip()
-
-            dev=str(
-                d.get("device","جهاز")
-            )
-
-            if len(phone)<7 or len(phone)>15:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"رقم الهاتف غير صحيح"
-                })
-
-
-            if not name:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"اكتب اسمك"
-                })
-
-
-            phone="+"+phone
-
-            row=c.execute(
-                "SELECT * FROM users WHERE phone=?",
-                (phone,)
-            ).fetchone()
-
-
-            if row:
-
-                c.execute("""
-                UPDATE users
-                SET name=?,
-                    online=1,
-                    device=?
-                WHERE id=?
-                """,(
-                    name,
-                    dev,
-                    row["id"]
-                ))
-
-                uid=row["id"]
-
-            else:
-
-                cur=c.execute("""
-                INSERT INTO users(
-                    phone,
-                    name,
-                    online,
-                    device
-                )
-                VALUES(?,?,1,?)
-                """,(
-                    phone,
-                    name,
-                    dev
-                ))
-
-                uid=cur.lastrowid
-
-
-            c.commit()
-
-
-            row=c.execute(
-                "SELECT * FROM users WHERE id=?",
-                (uid,)
-            ).fetchone()
-
-
-            return self.send_json({
-                "ok":True,
-                "user":dict(row)
-            })
-
-
-        if self.path=="/api/add":
-
-            phone=re.sub(
-                r"\D",
-                "",
-                str(d.get("phone",""))
-            )
-
-            uid=int(d.get("user",0))
-
-            if len(phone)<7 or len(phone)>15:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"رقم الهاتف غير صحيح"
-                })
-
-
-            phone="+"+phone
-
-
-            row=c.execute(
-                "SELECT * FROM users WHERE phone=?",
-                (phone,)
-            ).fetchone()
-
-
-            if not row:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"هذا الرقم غير مسجل في NEXA"
-                })
-
-
-            if row["id"]==uid:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"لا يمكنك إضافة نفسك"
-                })
-
-
-            c.execute(
-                "INSERT OR IGNORE INTO contacts VALUES(?,?)",
-                (uid,row["id"])
-            )
-
-            c.execute(
-                "INSERT OR IGNORE INTO contacts VALUES(?,?)",
-                (row["id"],uid)
-            )
-
-            c.commit()
-
-
-            return self.send_json({
-                "ok":True
-            })
-
-
-        if self.path=="/api/send":
-
-            try:
-                sender=int(d.get("sender"))
-                receiver=int(d.get("receiver"))
-            except:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"حساب غير صحيح"
-                })
-
-
-            text=str(
-                d.get("text","")
-            ).strip()
-
-
-            if not text:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"الرسالة فارغة"
-                })
-
-
-            if len(text)>5000:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"الرسالة طويلة جدًا"
-                })
-
-
-            exists=c.execute(
-                "SELECT id FROM users WHERE id=?",
-                (receiver,)
-            ).fetchone()
-
-
-            if not exists:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"المستخدم غير موجود"
-                })
-
-
-            c.execute("""
-            INSERT INTO messages(
-                sender,
-                receiver,
-                text
-            )
-            VALUES(?,?,?)
-            """,(
-                sender,
-                receiver,
-                text
-            ))
-
-            c.commit()
-
-
-            return self.send_json({
-                "ok":True
-            })
-
-
-        if self.path=="/api/profile":
-
-            try:
-                uid=int(d.get("id"))
-            except:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"حساب غير صحيح"
-                })
-
-
-            name=str(
-                d.get("name","")
-            ).strip()[:40]
-
-            bio=str(
-                d.get("bio","")
-            ).strip()[:200]
-
-            avatar=str(
-                d.get("avatar","👤")
-            ).strip()[:8]
-
-
-            if not name:
-                name="NEXA User"
-
-
-            if not avatar:
-                avatar="👤"
-
-
-            c.execute("""
-            UPDATE users
-            SET name=?,
-                bio=?,
-                avatar=?
-            WHERE id=?
-            """,(
-                name,
-                bio,
-                avatar,
-                uid
-            ))
-
-            c.commit()
-
-
-            row=c.execute(
-                "SELECT * FROM users WHERE id=?",
-                (uid,)
-            ).fetchone()
-
-
-            if not row:
-
-                return self.send_json({
-                    "ok":False,
-                    "error":"المستخدم غير موجود"
-                })
-
-
-            return self.send_json({
-                "ok":True,
-                "user":dict(row)
-            })
-
-
-        return self.send_json({
-            "ok":False,
-            "error":"Not found"
-        })
-
-
-conn()
-
-print("")
-print("🚀 NEXA Chat v3")
-print("🌐 http://127.0.0.1:8080")
-print("")
-
-import os
-
-PORT=int(os.environ.get("PORT","8080"))
-
-ThreadingHTTPServer(
-    ("0.0.0.0",PORT),
-    Server
-).serve_forever()
+        path = urlparse(self.path).path
+        c = db()
+        try:
+            data = json_body(self)
+            if path == "/api/consent":
+                if not data.get("accepted"):
+                    return send(self, {"error": "الموافقة مطلوبة"}, 400)
+                c.execute("INSERT INTO consents(version,accepted_at) VALUES('1',?)", (now(),)); c.commit()
+                return send(self, {"ok": True})
+            if path == "/api/memories":
+                content = str(data.get("content", "")).strip()[:300]
+                category = str(data.get("category", "تفضيل")).strip()[:40] or "تفضيل"
+                if len(content) < 2:
+                    return send(self, {"error": "اكتب ذكرى مفيدة أولًا"}, 400)
+                c.execute("INSERT INTO memories(content,category,source,created_at) VALUES(?,?,?,?)", (content, category, "اختيار المستخدم", now())); c.commit()
+                memory = dict(c.execute("SELECT id,content,category,source,created_at FROM memories ORDER BY id DESC LIMIT 1").fetchone())
+                return send(self, {"ok": True, "memory": memory})
+            if path == "/api/chat":
+                if not has_consent(c):
+                    return send(self, {"error": "وافق على الشروط قبل المحادثة"}, 403)
+                text = str(data.get("text", "")).strip()[:5000]
+                if not text:
+                    return send(self, {"error": "الرسالة فارغة"}, 400)
+                c.execute("INSERT INTO messages(role,text,created_at) VALUES('user',?,?)", (text, now())); c.commit()
+                history = rows(c, "SELECT role,text FROM messages ORDER BY id DESC LIMIT 16")
+                history.reverse()
+                messages = [{"role": "system", "content": system_prompt(c)}] + [{"role": x["role"], "content": x["text"]} for x in history]
+                answer, _ = call_ai(messages, c)
+                c.execute("INSERT INTO messages(role,text,created_at) VALUES('assistant',?,?)", (answer, now())); c.commit()
+                message = dict(c.execute("SELECT id,role,text,created_at FROM messages ORDER BY id DESC LIMIT 1").fetchone())
+                return send(self, {"ok": True, "message": message})
+            return send(self, {"error": "غير موجود"}, 404)
+        finally:
+            c.close()
+
+    def do_DELETE(self):
+        path = urlparse(self.path)
+        c = db()
+        try:
+            if path.path == "/api/memories":
+                try: memory_id = int(parse_qs(path.query).get("id", [""])[0])
+                except Exception: return send(self, {"error": "معرف غير صحيح"}, 400)
+                c.execute("DELETE FROM memories WHERE id=?", (memory_id,)); c.commit()
+                return send(self, {"ok": True})
+            return send(self, {"error": "غير موجود"}, 404)
+        finally:
+            c.close()
+
+
+if __name__ == "__main__":
+    db().close()
+    port = int(os.environ.get("PORT", "8080"))
+    print(f"{APP_NAME} يعمل على المنفذ {port}")
+    ThreadingHTTPServer(("0.0.0.0", port), Server).serve_forever()
