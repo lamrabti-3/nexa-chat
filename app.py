@@ -51,6 +51,15 @@ def db():
     c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
+    old_messages = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'").fetchone()
+    if old_messages:
+        columns = [row[1] for row in c.execute("PRAGMA table_info(messages)").fetchall()]
+        if "role" not in columns:
+            backup = "legacy_messages"
+            if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (backup,)).fetchone():
+                backup = "legacy_messages_" + str(int(datetime.now(timezone.utc).timestamp()))
+            c.execute(f'ALTER TABLE messages RENAME TO "{backup}"')
+
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
