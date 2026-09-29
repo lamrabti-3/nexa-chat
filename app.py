@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-APP_NAME = "NEXA | مساعدي الشخصي"
+APP_NAME = "رَفيق | مساعدي الشخصي"
+ACCESS_CODE = os.environ.get("RAFIQ_ACCESS_CODE") or os.environ.get("NEXA_ACCESS_CODE", "")
+COOKIE_NAME = "rafiq_session"
 DB_PATH = os.environ.get("NEXA_DB", "nexa.db")
 AI_KEY = os.environ.get("AI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 AI_URL = os.environ.get("AI_API_URL") or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
@@ -126,14 +128,23 @@ def json_body(handler):
         return {}
 
 
-def send(handler, payload, status=200):
+def send(handler, payload, status=200, extra_headers=None):
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))
     handler.send_header("Cache-Control", "no-store")
+    if extra_headers:
+        for key, value in extra_headers.items():
+            handler.send_header(key, value)
     handler.end_headers()
     handler.wfile.write(data)
+
+
+def authorized(handler):
+    if not ACCESS_CODE:
+        return True
+    return f"{COOKIE_NAME}=ok" in handler.headers.get("Cookie", "")
 
 
 def system_prompt(c):
@@ -141,7 +152,7 @@ def system_prompt(c):
     mem = rows(c, "SELECT content,category FROM memories ORDER BY id DESC LIMIT ?", (MEMORY_LIMIT,))
     memories = "\n".join(f"- [{m['category']}] {m['content']}" for m in reversed(mem)) or "لا توجد ذكريات محفوظة بعد."
     sources = "\n".join(f"- {s['title']}: {s['summary']}" for s in rows(c, "SELECT title,summary FROM research_sources ORDER BY id"))
-    return f"""أنت NEXA، مساعد شخصي خاص بالمستخدم.
+    return f"""أنت رَفيق، مساعد شخصي خاص بالمستخدم.
 
 هوية المستخدم وتفضيلاته الحالية:
 - الاسم: {p['name']}
@@ -210,37 +221,39 @@ HTML = r'''<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#08121d">
-<title>NEXA | مساعدي الشخصي</title>
+<title>رَفيق | مساعدي الشخصي</title>
 <style>
 :root{--bg:#07111b;--panel:#0e1c2a;--panel2:#132638;--line:#24384a;--text:#eef7fb;--muted:#91a8b8;--accent:#49e0b0;--accent2:#2ab896;--bubble:#172c3b;--mine:#135c55;--danger:#ff7373;--shadow:0 20px 60px #0004}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,#103b49 0,#07111b 38%);color:var(--text);font-family:Arial,"Noto Sans Arabic",sans-serif;height:100vh}button,input,textarea{font:inherit}button{cursor:pointer;border:0}.app{height:100vh;display:grid;grid-template-columns:300px 1fr;max-width:1500px;margin:auto}.side{background:#0b1926dd;border-left:1px solid var(--line);padding:22px;display:flex;flex-direction:column;gap:20px}.brand{display:flex;align-items:center;gap:12px}.mark{width:45px;height:45px;display:grid;place-items:center;border-radius:15px;background:linear-gradient(135deg,var(--accent),#1a7f88);color:#05231e;font-size:21px;font-weight:900}.brand b{font-size:22px}.brand small{display:block;color:var(--muted);margin-top:3px}.nav{display:grid;gap:8px}.nav button{background:transparent;color:var(--muted);text-align:right;padding:13px 14px;border-radius:12px}.nav button.active,.nav button:hover{background:var(--panel2);color:var(--text)}.tip{margin-top:auto;border:1px solid var(--line);border-radius:16px;padding:15px;color:var(--muted);font-size:13px;line-height:1.7}.content{min-width:0;display:flex;flex-direction:column}.head{height:78px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#091824aa}.head h1{font-size:20px;margin:0}.head p{color:var(--muted);font-size:12px;margin:5px 0 0}.badge{background:#123c38;color:var(--accent);border:1px solid #246859;padding:7px 11px;border-radius:30px;font-size:12px}.view{display:none;height:calc(100vh - 78px);padding:25px;overflow:auto}.view.active{display:block}.chat{display:flex;flex-direction:column;min-height:100%;max-width:920px;margin:auto}.messages{flex:1;display:flex;flex-direction:column;gap:13px;padding-bottom:18px}.welcome{margin:auto;max-width:610px;text-align:center;padding:30px}.welcome .orb{font-size:48px;margin-bottom:10px}.welcome h2{font-size:30px;margin:7px 0}.welcome p{color:var(--muted);line-height:1.8}.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:20px}.chip{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:25px;padding:9px 13px}.msg{max-width:78%;padding:14px 16px;border:1px solid var(--line);border-radius:18px;line-height:1.75;white-space:pre-wrap;box-shadow:0 8px 25px #0002}.msg.user{align-self:flex-start;background:var(--mine);border-bottom-left-radius:5px}.msg.assistant{align-self:flex-end;background:var(--bubble);border-bottom-right-radius:5px}.meta{font-size:11px;color:var(--muted);margin-top:5px}.save{background:transparent;color:var(--accent);font-size:11px;padding:0;margin-top:7px}.composer{display:flex;gap:10px;align-items:flex-end;padding-top:12px;border-top:1px solid var(--line)}textarea{width:100%;resize:none;min-height:52px;max-height:150px;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:16px;padding:14px;outline:0}textarea:focus{border-color:var(--accent)}.send{background:var(--accent);color:#05231e;border-radius:15px;padding:14px 19px;font-weight:bold;height:52px}.send:disabled{opacity:.5}.panel{max-width:900px;margin:auto}.panel h2{margin-top:0}.sub{color:var(--muted);line-height:1.8}.card{background:#0e1c2aee;border:1px solid var(--line);border-radius:18px;padding:18px;margin:12px 0;box-shadow:var(--shadow)}.memory{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.memory b{display:block;color:var(--accent);font-size:12px;margin-bottom:6px}.memory p{margin:0;line-height:1.6}.delete{background:transparent;color:var(--danger);font-size:18px}.form{display:grid;gap:10px;margin:16px 0}.form input{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:13px;outline:0}.primary{background:var(--accent);color:#05231e;border-radius:12px;padding:12px 17px;font-weight:bold}.source{display:flex;gap:14px;align-items:flex-start}.source .icon2{font-size:24px}.source h3{font-size:16px;margin:0 0 7px}.source p{color:var(--muted);line-height:1.7;margin:0 0 8px}.source a{color:var(--accent);font-size:12px}.overlay{position:fixed;inset:0;background:#020810dd;backdrop-filter:blur(8px);display:none;place-items:center;padding:20px;z-index:10}.overlay.show{display:grid}.consent{max-width:550px;background:var(--panel);border:1px solid #35536a;border-radius:22px;padding:27px;box-shadow:var(--shadow)}.consent h2{margin-top:0}.consent p,.consent li{color:var(--muted);line-height:1.8}.check{display:flex;gap:10px;align-items:flex-start;margin:20px 0}.check input{accent-color:var(--accent);margin-top:6px}.empty{color:var(--muted);text-align:center;padding:30px}@media(max-width:780px){.app{display:block}.side{height:auto;padding:12px 15px;border-left:0;border-bottom:1px solid var(--line)}.brand{justify-content:center}.nav{display:flex;overflow:auto}.nav button{white-space:nowrap}.tip{display:none}.content{height:calc(100vh - 135px)}.head{padding:0 15px}.view{height:calc(100vh - 213px);padding:15px}.msg{max-width:90%}.welcome h2{font-size:24px}}
 </style></head>
 <body>
 <div class="app">
-<aside class="side"><div class="brand"><div class="mark">N</div><div><b>NEXA</b><small>مساعدك الشخصي</small></div></div>
-<nav class="nav"><button class="active" data-view="chat">💬 المحادثة</button><button data-view="memories">🧠 ذاكرتي</button><button data-view="research">📚 مصادر علمية</button></nav>
-<div class="tip">يتعلم NEXA فقط من المعلومات التي تختار حفظها. يمكنك حذفها في أي وقت، ولن يحوّل كلامك إلى تشخيص نفسي.</div></aside>
+<aside class="side"><div class="brand"><div class="mark">N</div><div><b>رَفيق</b><small>مساعدك الشخصي</small></div></div>
+<nav class="nav"><button class="active" data-view="chat">💬 المحادثة</button><button data-view="memories">🧠 ذاكرتي</button><button data-view="research">📚 مصادر علمية</button><button data-view="settings">⚙️ الإعدادات</button></nav>
+<div class="tip">يتعلم رَفيق فقط من المعلومات التي تختار حفظها. يمكنك حذفها في أي وقت، ولن يحوّل كلامك إلى تشخيص نفسي.</div></aside>
 <main class="content"><header class="head"><div><h1 id="title">محادثة خاصة</h1><p id="subtitle">مساحة شخصية لك وحدك</p></div><span class="badge" id="status">الوضع المحلي</span></header>
 <section class="view active" id="view-chat"><div class="chat"><div class="messages" id="messages"></div><form class="composer" id="composer"><textarea id="input" rows="1" placeholder="اكتب ما تفكر فيه..."></textarea><button class="send" id="send" type="submit">إرسال</button></form></div></section>
 <section class="view" id="view-memories"><div class="panel"><h2>ذاكرتي</h2><p class="sub">أضف تفضيلات أو أهدافًا تريد أن يستخدمها NEXA. لا تضف معلومات حساسة لا تحتاجها.</p><form class="form" id="memory-form"><input id="memory" maxlength="300" placeholder="مثال: أفضل الإجابات المختصرة مع خطوات عملية" required><input id="category" maxlength="40" value="تفضيل" placeholder="التصنيف"><button class="primary">حفظ الذكرى</button></form><div id="memory-list"></div></div></section>
-<section class="view" id="view-research"><div class="panel"><h2>مصادر علمية مختارة</h2><p class="sub">هذه المراجع تساعد NEXA على استخدام مبادئ عامة بحذر. لا تُستخدم لتشخيصك أو إصدار حكم نهائي على شخصيتك.</p><div id="research-list"></div></div></section>
+<section class="view" id="view-research"><div class="panel"><h2>مصادر علمية مختارة</h2><p class="sub">هذه المراجع تساعد رَفيق على استخدام مبادئ عامة بحذر. لا تُستخدم لتشخيصك أو إصدار حكم نهائي على شخصيتك.</p><div id="research-list"></div></div></section>
+<section class="view" id="view-settings"><div class="panel"><h2>إعدادات رَفيق</h2><p class="sub">عدّل طريقة مخاطبتك وهدف المساعد. هذه البيانات محلية داخل قاعدة التطبيق.</p><form class="form" id="profile-form"><input id="profile-name" maxlength="40" placeholder="اسمك"><input id="profile-tone" maxlength="80" placeholder="النبرة التي تفضلها"><input id="profile-goal" maxlength="200" placeholder="ما الذي تريد أن يساعدك فيه؟"><button class="primary">حفظ الإعدادات</button></form><div class="card"><h3>بياناتك</h3><p class="sub">يمكنك تنزيل نسخة JSON من ذكرياتك ومحادثاتك أو مسح المحادثة فقط.</p><div class="chips" style="justify-content:flex-start"><button class="chip" id="export-data">⬇️ تصدير بياناتي</button><button class="chip" id="clear-chat">🗑️ مسح المحادثة</button></div></div></div></section>
 </main></div>
-<div class="overlay" id="consent"><div class="consent"><h2>قبل أن نبدأ</h2><p>هذا مساعد ذكاء اصطناعي شخصي. لكي يعمل، اقرأ ووافق:</p><ul><li>الردود آلية وقد تكون غير دقيقة.</li><li>تحليل الشخصية تقريبي وليس تشخيصًا طبيًا أو نفسيًا.</li><li>لا تعتمد عليه وحده في القرارات الطبية أو القانونية أو المالية.</li><li>لن يحفظ NEXA معلومة كذكرى إلا باختيارك، ويمكنك حذفها.</li></ul><label class="check"><input type="checkbox" id="agree"><span>أفهم هذه الحدود وأوافق على استخدام المساعد.</span></label><button class="primary" id="accept" disabled>أوافق وأبدأ</button></div></div>
+<div class="overlay" id="loginOverlay"><div class="consent"><h2>رَفيق خاص بك</h2><p>أدخل رمز الوصول لفتح التطبيق.</p><form class="form" id="login-form"><input id="access-code" type="password" autocomplete="current-password" placeholder="رمز الوصول" required><button class="primary">دخول</button></form><p id="login-error" class="sub"></p></div></div><div class="overlay" id="consent"><div class="consent"><h2>قبل أن نبدأ</h2><p>هذا مساعد ذكاء اصطناعي شخصي. لكي يعمل، اقرأ ووافق:</p><ul><li>الردود آلية وقد تكون غير دقيقة.</li><li>تحليل الشخصية تقريبي وليس تشخيصًا طبيًا أو نفسيًا.</li><li>لا تعتمد عليه وحده في القرارات الطبية أو القانونية أو المالية.</li><li>لن يحفظ NEXA معلومة كذكرى إلا باختيارك، ويمكنك حذفها.</li></ul><label class="check"><input type="checkbox" id="agree"><span>أفهم هذه الحدود وأوافق على استخدام المساعد.</span></label><button class="primary" id="accept" disabled>أوافق وأبدأ</button></div></div>
 <script>
-const $=s=>document.querySelector(s);const state={messages:[],memories:[],research:[],consent:false};
-async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const d=await r.json();if(!r.ok)throw new Error(d.error||'حدث خطأ');return d}
+const $=s=>document.querySelector(s);const state={messages:[],memories:[],research:[],consent:false,profile:{}};
+async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const d=await r.json();if(!r.ok){const e=new Error(d.error||'حدث خطأ');e.data=d;throw e}return d}
 function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-function show(view){document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===view));document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+view));const titles={chat:['محادثة خاصة','مساحة شخصية لك وحدك'],memories:['ذاكرتي','أنت تختار ما الذي يتعلمه NEXA عنك'],research:['مصادر علمية مختارة','مبادئ عامة، وليست تشخيصًا']};$('#title').textContent=titles[view][0];$('#subtitle').textContent=titles[view][1]}
-function renderMessages(){const box=$('#messages');if(!state.messages.length){box.innerHTML='<div class="welcome"><div class="orb">🧠</div><h2>مرحبًا، أنا NEXA</h2><p>مساعدك الشخصي لفهم الأفكار وتنظيمها. ابدأ برسالة، وإذا أردت أن أتذكر شيئًا اضغط «حفظ كذكرى» بنفسك.</p><div class="chips"><button class="chip" onclick="quick('ساعدني أنظم أهدافي')">تنظيم الأهداف</button><button class="chip" onclick="quick('كيف يمكن أن أفهم سلوكي دون تشخيص؟')">فهم السلوك</button></div></div>';return}box.innerHTML=state.messages.map(m=>'<div class="msg '+m.role+'"><div>'+esc(m.text)+'</div><div class="meta">'+(m.role==='user'?'أنت':'NEXA')+' · '+new Date(m.created_at).toLocaleTimeString('ar-MA',{hour:'2-digit',minute:'2-digit'})+'</div>'+(m.role==='user'?'<button class="save" onclick="saveText('+JSON.stringify(m.text)+')">＋ حفظ كذكرى</button>':'')+'</div>').join('');box.scrollTop=box.scrollHeight}
+function show(view){document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===view));document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+view));const titles={chat:['محادثة خاصة','مساحة شخصية لك وحدك'],memories:['ذاكرتي','أنت تختار ما الذي يتعلمه رَفيق عنك'],research:['مصادر علمية مختارة','مبادئ عامة، وليست تشخيصًا'],settings:['الإعدادات','خصص رَفيق ليعمل بالطريقة التي تناسبك']};$('#title').textContent=titles[view][0];$('#subtitle').textContent=titles[view][1]}
+function renderMessages(){const box=$('#messages');if(!state.messages.length){box.innerHTML='<div class="welcome"><div class="orb">🧠</div><h2>مرحبًا، أنا رَفيق</h2><p>مساعدك الشخصي لفهم الأفكار وتنظيمها. ابدأ برسالة، وإذا أردت أن أتذكر شيئًا اضغط «حفظ كذكرى» بنفسك.</p><div class="chips"><button class="chip" onclick="quick('ساعدني أنظم أهدافي')">تنظيم الأهداف</button><button class="chip" onclick="quick('كيف يمكن أن أفهم سلوكي دون تشخيص؟')">فهم السلوك</button></div></div>';return}box.innerHTML=state.messages.map(m=>'<div class="msg '+m.role+'"><div>'+esc(m.text)+'</div><div class="meta">'+(m.role==='user'?'أنت':'NEXA')+' · '+new Date(m.created_at).toLocaleTimeString('ar-MA',{hour:'2-digit',minute:'2-digit'})+'</div>'+(m.role==='user'?'<button class="save" onclick="saveText('+JSON.stringify(m.text)+')">＋ حفظ كذكرى</button>':'')+'</div>').join('');box.scrollTop=box.scrollHeight}
 function renderMemories(){const box=$('#memory-list');box.innerHTML=state.memories.length?state.memories.map(m=>'<div class="card memory"><div><b>'+esc(m.category)+'</b><p>'+esc(m.content)+'</p></div><button class="delete" onclick="removeMemory('+m.id+')">×</button></div>').join(''):'<div class="empty">لا توجد ذكريات محفوظة بعد.</div>'}
+function renderProfile(){$('#profile-name').value=state.profile.name||'';$('#profile-tone').value=state.profile.tone||'';$('#profile-goal').value=state.profile.goal||''}
 function renderResearch(){ $('#research-list').innerHTML=state.research.map(s=>'<article class="card source"><div class="icon2">📖</div><div><h3>'+esc(s.title)+'</h3><p>'+esc(s.summary)+'</p><a href="'+esc(s.url)+'" target="_blank" rel="noreferrer">فتح المصدر ↗</a></div></article>').join('') }
-async function load(){const d=await api('/api/state');Object.assign(state,d);$('#status').textContent=d.ai_ready?'AI متصل':'وضع محلي';renderMessages();renderMemories();renderResearch();if(!d.consent)$('#consent').classList.add('show');else enable()}
+async function load(){try{const d=await api('/api/state');Object.assign(state,d);$('#status').textContent=d.ai_ready?'AI متصل':'وضع محلي';renderMessages();renderMemories();renderResearch();renderProfile();if(!d.consent)$('#consent').classList.add('show');else enable()}catch(e){if(e.data&&e.data.access_required)$('#loginOverlay').classList.add('show');else alert(e.message)}}
 function enable(){$('#input').disabled=false;$('#send').disabled=false}
 async function sendMessage(text){text=(text||'').trim();if(!text||!state.consent)return;$('#input').value='';$('#send').disabled=true;state.messages.push({role:'user',text,created_at:new Date().toISOString()});renderMessages();try{const d=await api('/api/chat',{method:'POST',body:JSON.stringify({text})});state.messages.push(d.message);renderMessages()}catch(e){alert(e.message)}finally{$('#send').disabled=false;$('#input').focus()}}
 function quick(t){show('chat');sendMessage(t)}
 async function saveText(text){const category=prompt('تصنيف الذكرى؟','تفضيل');if(category===null)return;try{const d=await api('/api/memories',{method:'POST',body:JSON.stringify({content:text,category})});state.memories.unshift(d.memory);renderMemories();alert('تم حفظ الذكرى ويمكنك حذفها من قسم ذاكرتي.')}catch(e){alert(e.message)}}
 async function removeMemory(id){if(!confirm('حذف هذه الذكرى؟'))return;await api('/api/memories?id='+id,{method:'DELETE'});state.memories=state.memories.filter(m=>m.id!==id);renderMemories()}
-$('#composer').addEventListener('submit',e=>{e.preventDefault();sendMessage($('#input').value)});$('#input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#composer').requestSubmit()}});document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>show(b.dataset.view)));$('#agree').addEventListener('change',e=>$('#accept').disabled=!e.target.checked);$('#accept').addEventListener('click',async()=>{try{await api('/api/consent',{method:'POST',body:JSON.stringify({accepted:true})});state.consent=true;$('#consent').classList.remove('show');enable()}catch(e){alert(e.message)}});$('#memory-form').addEventListener('submit',async e=>{e.preventDefault();try{const d=await api('/api/memories',{method:'POST',body:JSON.stringify({content:$('#memory').value,category:$('#category').value})});state.memories.unshift(d.memory);$('#memory').value='';renderMemories()}catch(e){alert(e.message)}});load();
+$('#composer').addEventListener('submit',e=>{e.preventDefault();sendMessage($('#input').value)});$('#login-form').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/login',{method:'POST',body:JSON.stringify({code:$('#access-code').value})});$('#loginOverlay').classList.remove('show');load()}catch(err){$('#login-error').textContent=err.message}});$('#profile-form').addEventListener('submit',async e=>{e.preventDefault();try{const d=await api('/api/profile',{method:'POST',body:JSON.stringify({name:$('#profile-name').value,tone:$('#profile-tone').value,goal:$('#profile-goal').value})});state.profile=d.profile;alert('تم حفظ الإعدادات')}catch(err){alert(err.message)}});$('#export-data').addEventListener('click',()=>{window.location.href='/api/export'});$('#clear-chat').addEventListener('click',async()=>{if(!confirm('مسح كل رسائل المحادثة؟ لا يمكن التراجع عن ذلك.'))return;await api('/api/clear-chat',{method:'POST'});state.messages=[];renderMessages()});$('#input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#composer').requestSubmit()}});document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>show(b.dataset.view)));$('#agree').addEventListener('change',e=>$('#accept').disabled=!e.target.checked);$('#accept').addEventListener('click',async()=>{try{await api('/api/consent',{method:'POST',body:JSON.stringify({accepted:true})});state.consent=true;$('#consent').classList.remove('show');enable()}catch(e){alert(e.message)}});$('#memory-form').addEventListener('submit',async e=>{e.preventDefault();try{const d=await api('/api/memories',{method:'POST',body:JSON.stringify({content:$('#memory').value,category:$('#category').value})});state.memories.unshift(d.memory);$('#memory').value='';renderMemories()}catch(e){alert(e.message)}});load();
 </script></body></html>'''
 
 
@@ -262,10 +275,16 @@ class Server(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 return self.send_html()
+            if path.startswith("/api/") and path != "/api/health" and not authorized(self):
+                return send(self, {"error": "رمز الوصول مطلوب", "access_required": True}, 401)
+            if path == "/api/health":
+                return send(self, {"ok": True, "app": APP_NAME, "ai_ready": bool(AI_KEY)})
             if path == "/api/state":
                 return send(self, {
                     "consent": has_consent(c),
                     "ai_ready": bool(AI_KEY),
+                    "access_required": bool(ACCESS_CODE),
+                    "app_name": APP_NAME,
                     "profile": profile(c),
                     "messages": rows(c, "SELECT id,role,text,created_at FROM messages ORDER BY id ASC LIMIT 100"),
                     "memories": rows(c, "SELECT id,content,category,source,created_at FROM memories ORDER BY id DESC"),
@@ -281,11 +300,29 @@ class Server(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         c = db()
         try:
+            if path != "/api/login" and not authorized(self):
+                return send(self, {"error": "رمز الوصول مطلوب", "access_required": True}, 401)
             data = json_body(self)
+            if path == "/api/login":
+                if ACCESS_CODE and str(data.get("code", "")) != ACCESS_CODE:
+                    return send(self, {"error": "رمز الوصول غير صحيح"}, 401)
+                headers = {"Set-Cookie": f"{COOKIE_NAME}=ok; HttpOnly; SameSite=Strict; Path=/"} if ACCESS_CODE else None
+                return send(self, {"ok": True}, extra_headers=headers)
             if path == "/api/consent":
                 if not data.get("accepted"):
                     return send(self, {"error": "الموافقة مطلوبة"}, 400)
                 c.execute("INSERT INTO consents(version,accepted_at) VALUES('1',?)", (now(),)); c.commit()
+                return send(self, {"ok": True})
+            if path == "/api/profile":
+                updated = {
+                    "name": str(data.get("name", "صاحب رفيق")).strip()[:40] or "صاحب رفيق",
+                    "tone": str(data.get("tone", "واضح وعملي")).strip()[:80] or "واضح وعملي",
+                    "goal": str(data.get("goal", "مساعد شخصي يفهمني ويحترم خصوصيتي")).strip()[:200] or "مساعد شخصي يفهمني ويحترم خصوصيتي"
+                }
+                c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('profile',?)", (json.dumps(updated, ensure_ascii=False),)); c.commit()
+                return send(self, {"ok": True, "profile": updated})
+            if path == "/api/clear-chat":
+                c.execute("DELETE FROM messages"); c.commit()
                 return send(self, {"ok": True})
             if path == "/api/memories":
                 content = str(data.get("content", "")).strip()[:300]
@@ -317,6 +354,8 @@ class Server(BaseHTTPRequestHandler):
         path = urlparse(self.path)
         c = db()
         try:
+            if not authorized(self):
+                return send(self, {"error": "رمز الوصول مطلوب", "access_required": True}, 401)
             if path.path == "/api/memories":
                 try: memory_id = int(parse_qs(path.query).get("id", [""])[0])
                 except Exception: return send(self, {"error": "معرف غير صحيح"}, 400)
